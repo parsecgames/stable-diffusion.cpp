@@ -14,6 +14,7 @@
 #include "core/util.h"
 #include "model/diffusion/model.hpp"
 #include "model/te/clip.hpp"
+#include "model/te/llada_image_te.hpp"
 #include "model/te/llm.hpp"
 #include "model/te/t5.hpp"
 #include "model_loader.h"
@@ -1978,7 +1979,8 @@ struct LLMEmbedder : public Conditioner {
             arch = LLM::LLMArch::GPT_OSS_20B;
         } else if (sd_version_is_pid(version)) {
             arch = LLM::LLMArch::GEMMA2_2B;
-        } else if (sd_version_is_lingbot_video(version) ||
+        } else if (version == VERSION_QWEN_IMAGE_2_1 ||
+                   sd_version_is_lingbot_video(version) ||
                    sd_version_is_ideogram4(version) ||
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_sefi_image(version) ||
@@ -2547,6 +2549,67 @@ struct LLMEmbedder : public Conditioner {
             prompt += conditioner_params.text;
             prompt_attn_range = {0, 0};
             prompt += "<|im_end|>\n<|im_start|>assistant\n";
+        } else if (version == VERSION_QWEN_IMAGE_2_1) {
+            if (!llm->enable_vision && conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
+                LOG_ERROR("Qwen Image 2.1 editing requires Qwen3-VL vision weights; provide --llm_vision or a combined encoder");
+                return {};
+            }
+            prompt = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
+            std::vector<int> system_tokens;
+            if (!tokenizer->encode(prompt, system_tokens, nullptr)) {
+                return {};
+            }
+            prompt_template_encode_start_idx = static_cast<int>(system_tokens.size());
+            out_layers                       = {static_cast<int>(llm->config.num_layers)};
+            prompt += "<|im_start|>user\n";
+            if (llm->enable_vision && conditioner_params.ref_images != nullptr) {
+                for (size_t i = 0; i < conditioner_params.ref_images->size(); ++i) {
+                    const auto& image = (*conditioner_params.ref_images)[i];
+                    int64_t width     = image.shape()[0];
+                    int64_t height    = image.shape()[1];
+                    int64_t pixels    = width * height;
+                    if (width % 32 != 0 || height % 32 != 0) {
+                        LOG_ERROR("Qwen Image 2.1 reference dimensions must be multiples of 32");
+                        return {};
+                    }
+                    auto rgb = sd::Tensor<float>({width, height, 3, 1});
+                    for (int64_t p = 0; p < pixels; ++p) {
+                        float alpha = image.shape()[2] == 4 ? image[p + 3 * pixels] : 1.f;
+                        for (int c = 0; c < 3; ++c) {
+                            rgb[p + c * pixels] = 2.f * (image[p + c * pixels] * alpha + 1.f - alpha) - 1.f;
+                        }
+                    }
+                    auto outputs = llm->encode_image_outputs(n_threads, rgb, false);
+                    if (outputs.empty()) {
+                        return {};
+                    }
+                    prompt += (i == 0 ? "" : " ") + std::string("<image") + std::to_string(i + 1) + "><|vision_start|>";
+                    std::vector<int> prefix_tokens;
+                    if (!tokenizer->encode(prompt, prefix_tokens, nullptr)) {
+                        return {};
+                    }
+                    int index = static_cast<int>(prefix_tokens.size());
+                    int count = static_cast<int>(outputs[0].shape()[1]);
+                    image_embeds.emplace_back(index, std::move(outputs[0]));
+                    if (deepstack_image_embeds.empty()) {
+                        deepstack_image_embeds.resize(outputs.size() - 1);
+                    }
+                    for (size_t layer = 1; layer < outputs.size(); ++layer) {
+                        deepstack_image_embeds[layer - 1].emplace_back(index, std::move(outputs[layer]));
+                    }
+                    image_grids.push_back({index, count,
+                                           static_cast<int>(height) / llm->config.vision.patch_size,
+                                           static_cast<int>(width) / llm->config.vision.patch_size});
+                    for (int j = 0; j < count; ++j) {
+                        prompt += "<|image_pad|>";
+                    }
+                    prompt += "<|vision_end|>";
+                }
+            }
+            prompt_attn_range.first = static_cast<int>(prompt.size());
+            prompt += conditioner_params.text.empty() ? " " : conditioner_params.text;
+            prompt_attn_range.second = static_cast<int>(prompt.size());
+            prompt += "<|im_end|>\n<|im_start|>assistant\n";
         } else if (sd_version_is_qwen_image(version) || sd_version_is_mage_flow(version)) {
             if (llm->enable_vision && conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty()) {
                 LOG_INFO("%s", sd_version_is_mage_flow(version) ? "MageFlowEditPipeline" : "QwenImageEditPlusPipeline");
@@ -3074,6 +3137,21 @@ struct LLMEmbedder : public Conditioner {
         SDCondition result;
         result.c_crossattn        = std::move(hidden_states);
         result.extra_c_crossattns = std::move(extra_hidden_states_vec);
+        if (version == VERSION_QWEN_IMAGE_2_1) {
+            auto slots = sd::Tensor<int32_t>::zeros({result.c_crossattn.shape()[1]});
+            for (size_t i = 0; i < image_embeds.size(); ++i) {
+                int64_t begin = image_embeds[i].first - prompt_template_encode_start_idx;
+                int64_t end   = begin + image_embeds[i].second.shape()[1];
+                if (begin < 0 || end > slots.numel()) {
+                    LOG_ERROR("Qwen Image 2.1 image slots exceed the encoded prompt");
+                    return {};
+                }
+                for (int64_t j = begin; j < end; ++j) {
+                    slots[j] = static_cast<int32_t>(i + 1);
+                }
+            }
+            result.c_token_types = std::move(slots);
+        }
         if (sd_version_is_minimax_h3(version)) {
             std::vector<int32_t> tags(static_cast<size_t>(result.c_crossattn.shape()[1]), 1);
             for (const auto& [index, image_embed] : image_embeds) {
@@ -3156,6 +3234,214 @@ struct LTXAVTextProjectionRunner : public GGMLRunner {
             return build_graph(x);
         };
         return take_or_empty(GGMLRunner::compute(get_graph, n_threads, auto_runner_end));
+    }
+};
+
+// LLaDA-Image's text path is a three-stage pipeline rather than a single encoder pass:
+// the token embeddings feed a QueryFormer whose 256 queries are appended to the backbone
+// input, and the backbone's final hidden states are projected to the denoiser's caption dim.
+// Ref: LLaDAImagePipeline._encode_text.
+struct LLaDAImageEmbedder : public Conditioner {
+    std::shared_ptr<Tokenizer> tokenizer;
+    std::shared_ptr<LLM::LLMRunner> llm;
+    std::shared_ptr<LLaDAImageTE::QueryFormerRunner> query_former;
+    std::shared_ptr<LLaDAImageTE::TextProjectionRunner> text_projection;
+    std::shared_ptr<LLaDAImageTE::SigVQRunner> sigvq;
+
+    std::string llm_prefix;
+    std::string query_former_prefix;
+    std::string text_projection_prefix;
+    std::string sigvq_prefix;
+
+    LLaDAImageEmbedder(ggml_backend_t backend,
+                       const String2TensorStorage& tensor_storage_map      = {},
+                       const std::string& llm_prefix                       = "text_encoders.llm",
+                       const std::string& query_former_prefix              = "queryformer",
+                       const std::string& text_projection_prefix           = "text_projection",
+                       const std::string& sigvq_prefix                     = "sigvq",
+                       std::shared_ptr<RunnerWeightManager> weight_manager = nullptr,
+                       const TokenizerConfig& tokenizers                   = {})
+        : llm_prefix(llm_prefix),
+          query_former_prefix(query_former_prefix),
+          text_projection_prefix(text_projection_prefix),
+          sigvq_prefix(sigvq_prefix) {
+        if (!tokenizers.has(TokenizerConfig::MAIN)) {
+            throw std::runtime_error("LLaDA-Image requires an external LLaDA2 tokenizer.json; pass --tokenizer FILE or set sd_ctx_params_t::tokenizer");
+        }
+        llm = std::make_shared<LLM::LLMRunner>(LLM::LLMArch::LLADA2_MOE,
+                                               backend,
+                                               tensor_storage_map,
+                                               llm_prefix,
+                                               false,
+                                               weight_manager);
+        // <|endoftext|> doubles as the pad token in LLaDA2's tokenizer.json.
+        tokenizer       = tokenizers.create(TokenizerConfig::MAIN, llm->config.vocab_size, 156892);
+        query_former    = std::make_shared<LLaDAImageTE::QueryFormerRunner>(backend,
+                                                                         tensor_storage_map,
+                                                                         query_former_prefix,
+                                                                         weight_manager);
+        text_projection = std::make_shared<LLaDAImageTE::TextProjectionRunner>(backend,
+                                                                               tensor_storage_map,
+                                                                               text_projection_prefix,
+                                                                               weight_manager);
+
+        // SigVQ is only present when the user supplies the editing weights.
+        for (const auto& [name, _] : tensor_storage_map) {
+            if (starts_with(name, sigvq_prefix + ".")) {
+                sigvq = std::make_shared<LLaDAImageTE::SigVQRunner>(backend,
+                                                                    tensor_storage_map,
+                                                                    sigvq_prefix,
+                                                                    weight_manager);
+                break;
+            }
+        }
+    }
+
+    void get_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        llm->get_param_tensors(tensors, llm_prefix);
+        query_former->get_param_tensors(tensors, query_former_prefix);
+        text_projection->get_param_tensors(tensors, text_projection_prefix);
+        if (sigvq != nullptr) {
+            sigvq->get_param_tensors(tensors, sigvq_prefix);
+        }
+    }
+
+    void get_param_tensor_ops(std::map<ggml_tensor*, enum ggml_op>& tensor_ops) override {
+        llm->get_param_tensor_ops(tensor_ops);
+    }
+
+    void set_flash_attention_enabled(bool enabled) override {
+        llm->set_flash_attention_enabled(enabled);
+        query_former->set_flash_attention_enabled(enabled);
+        text_projection->set_flash_attention_enabled(enabled);
+        if (sigvq != nullptr) {
+            sigvq->set_flash_attention_enabled(enabled);
+        }
+    }
+
+    void set_max_graph_vram_bytes(size_t max_vram_bytes) override {
+        llm->set_max_graph_vram_bytes(max_vram_bytes);
+        query_former->set_max_graph_vram_bytes(max_vram_bytes);
+        text_projection->set_max_graph_vram_bytes(max_vram_bytes);
+        if (sigvq != nullptr) {
+            sigvq->set_max_graph_vram_bytes(max_vram_bytes);
+        }
+    }
+
+    void set_runtime_backends(const std::vector<ggml_backend_t>& backends) override {
+        llm->set_runtime_backends(backends);
+    }
+
+    void set_graph_cut_layer_split_enabled(bool enabled) override {
+        llm->set_graph_cut_layer_split_enabled(enabled);
+    }
+
+    void set_graph_cut_layer_split_backend_vram_limits(const std::vector<size_t>& limits) override {
+        llm->set_graph_cut_layer_split_backend_vram_limits(limits);
+    }
+
+    void get_layer_split_param_tensors(std::map<std::string, ggml_tensor*>& tensors) override {
+        llm->get_param_tensors(tensors, llm_prefix);
+    }
+
+    void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) override {
+        llm->set_weight_adapter(adapter);
+        query_former->set_weight_adapter(adapter);
+        text_projection->set_weight_adapter(adapter);
+        if (sigvq != nullptr) {
+            sigvq->set_weight_adapter(adapter);
+        }
+    }
+
+    void runner_end() override {
+        llm->runner_end();
+        query_former->runner_end();
+        text_projection->runner_end();
+        if (sigvq != nullptr) {
+            sigvq->runner_end();
+        }
+    }
+
+    SDCondition get_learned_condition(int n_threads,
+                                      const ConditionerParams& conditioner_params) override {
+        const int64_t num_queries = 256;
+        const bool has_ref_images = conditioner_params.ref_images != nullptr && !conditioner_params.ref_images->empty();
+        if (has_ref_images && sigvq == nullptr) {
+            LOG_ERROR("LLaDA-Image editing requires connectors with SigVQ weights");
+            return {};
+        }
+
+        std::string text = conditioner_params.text;
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+            text.erase(text.begin());
+        }
+        while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+            text.pop_back();
+        }
+        std::string prompt = text.empty()
+                                 ? "<role>HUMAN</role> Generate an image.\n<role>ASSISTANT</role>\n<IMAGE1>"
+                                 : "<role>HUMAN</role> Generate an image: " + text + "\n<role>ASSISTANT</role>\n<IMAGE1>";
+
+        std::vector<int> tokens;
+        if (!tokenizer->encode(prompt, tokens, nullptr)) {
+            return {};
+        }
+        int64_t n_text = static_cast<int64_t>(tokens.size());
+        GGML_ASSERT(n_text > 0);
+
+        sd::Tensor<int32_t> text_ids({n_text}, std::vector<int32_t>(tokens.begin(), tokens.end()));
+        auto inputs_embeds = llm->compute_input_embeds(n_threads, text_ids);
+        auto query_embeds  = query_former->compute(n_threads, inputs_embeds);
+
+        // splice_image_embeds() replaces tokens in place, so the query slots have to exist in
+        // input_ids; their ids are irrelevant because the embeddings are overwritten.
+        std::vector<int32_t> padded(tokens.begin(), tokens.end());
+        padded.resize(static_cast<size_t>(n_text + num_queries), tokenizer->PAD_TOKEN_ID);
+        int64_t n_total = static_cast<int64_t>(padded.size());
+        sd::Tensor<int32_t> input_ids({n_total}, padded);
+
+        // Bidirectional everywhere except that the text tokens must not see the appended
+        // queries, matching backbone_attention_mask[:, :, :text_length, text_length:] = min.
+        const float mask_min = std::numeric_limits<float>::lowest() / 4.0f;
+        sd::Tensor<float> attention_mask({n_total, n_total});
+        for (int64_t i1 = 0; i1 < n_total; ++i1) {
+            for (int64_t i0 = 0; i0 < n_total; ++i0) {
+                float value                       = (i1 < n_text && i0 >= n_text) ? mask_min : 0.0f;
+                attention_mask[i0 + n_total * i1] = value;
+            }
+        }
+
+        LLM::ImageEmbeds image_embeds;
+        image_embeds.emplace_back(static_cast<int>(n_text), query_embeds);
+
+        std::set<int> out_layers = {static_cast<int>(llm->config.num_layers) + 1};
+        auto hidden_states       = llm->compute(n_threads,
+                                                input_ids,
+                                                attention_mask,
+                                                image_embeds,
+                                                out_layers);
+
+        SDCondition result;
+        result.c_crossattn = text_projection->compute(n_threads, hidden_states);
+
+        // Editing: SigVQ sees the reference at half the output resolution, as in
+        // LLaDAImagePipeline._encode_source_image.
+        if (has_ref_images) {
+            const auto& ref = conditioner_params.ref_images->front();
+            auto resized    = sd::ops::interpolate(ref,
+                                                   {conditioner_params.width / 2,
+                                                    conditioner_params.height / 2,
+                                                    ref.shape()[2],
+                                                    ref.shape()[3]},
+                                                   sd::ops::InterpolateMode::Bilinear);
+            resized         = resized * 2.f - 1.f;
+            auto semantic   = sigvq->compute(n_threads, resized);
+            if (semantic.empty()) {
+                return {};
+            }
+            result.extra_c_crossattns.push_back(std::move(semantic));
+        }
+        return result;
     }
 };
 

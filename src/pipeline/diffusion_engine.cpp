@@ -80,6 +80,7 @@ const char* model_version_to_str[] = {
     "LingBot Video",
     "Qwen Image",
     "Qwen Image Layered",
+    "Qwen Image 2.1",
     "Hunyuan Video",
     "Anima",
     "Flux.2",
@@ -100,6 +101,7 @@ const char* model_version_to_str[] = {
     "Krea2",
     "Mage Flow",
     "SenseNova U1.5",
+    "LLaDA-Image",
     "ESRGAN",
 };
 
@@ -856,11 +858,53 @@ bool StableDiffusionGGML::init_model_loader(ModelLoader& model_loader, ModelConf
     return true;
 }
 
+bool StableDiffusionGGML::set_sage_attention_enabled(bool enabled) {
+    if (!diffusion_model) {
+        return false;
+    }
+    if (enabled) {
+#ifndef SD_USE_UPSTREAM_GGML
+        auto* ctx = ggml_init({4 * ggml_tensor_overhead(), nullptr, true});
+        if (ctx == nullptr) {
+            return false;
+        }
+        auto* q        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, 1, 1);
+        auto* k        = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 128, 1, 1);
+        auto* v        = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, 128, 1, 1);
+        auto* op       = ggml_sage_attn(ctx, q, k, v, 1.f / sqrtf(128.f), GGML_SAGE_ATTN_AUTO);
+        bool supported = true;
+        for (auto backend : backend_manager.runtime_backends(SDBackendModule::DIFFUSION)) {
+            if (!ggml_backend_supports_op(backend, op)) {
+                LOG_ERROR("SageAttention is unavailable on %s; it requires patched GGML, CUDA Toolkit 12.0 or newer, and SM80 or newer kernels",
+                          ggml_backend_name(backend));
+                supported = false;
+            }
+        }
+        ggml_free(ctx);
+        if (!supported) {
+            return false;
+        }
+#else
+        LOG_ERROR("SageAttention requires -DSD_USE_UPSTREAM_GGML=OFF and a CUDA backend");
+        return false;
+#endif
+    }
+    diffusion_model->set_sage_attention_enabled(enabled);
+    if (high_noise_diffusion_model) {
+        high_noise_diffusion_model->set_sage_attention_enabled(enabled);
+    }
+    if (enabled) {
+        LOG_INFO("Using SageAttention in the diffusion model; CUDA selects the supported kernel, unsupported layers use flash/default attention");
+    }
+    return true;
+}
+
 bool StableDiffusionGGML::init(const sd_ctx_params_t* sd_ctx_params) {
 #ifdef SD_USE_UPSTREAM_GGML
     LOG_WARN(
-        "Using upstream GGML: FP8 and INT8 tensorwise/convrot are disabled. "
-        "Some operators may be unsupported and performance may be lower than with patched GGML.");
+        "Using upstream GGML: INT8 tensorwise/convrot is disabled and FP8 weights are "
+        "converted to F16 at load time. Some operators may be unsupported and performance "
+        "may be lower than with patched GGML.");
 #endif
     if (!validate_tensor_types(sd_ctx_params->wtype, sd_ctx_params->tensor_type_rules)) {
         return false;
@@ -1133,6 +1177,9 @@ bool StableDiffusionGGML::validate_and_load_runners() {
             high_noise_diffusion_model->set_flash_attention_enabled(true);
         }
     }
+    if (sd_ctx_params->sage_attn && !set_sage_attention_enabled(true)) {
+        return false;
+    }
     LOG_VERBOSE("validating model metadata");
 
     std::set<std::string> ignore_tensors;
@@ -1296,6 +1343,7 @@ bool StableDiffusionGGML::build_denoiser() {
                    sd_version_is_anima(version) ||
                    sd_version_is_ernie_image(version) ||
                    sd_version_is_z_image(version) ||
+                   sd_version_is_llada_image(version) ||
                    sd_version_is_boogu_image(version) ||
                    sd_version_is_pid(version) ||
                    sd_version_is_ideogram4(version)) {
@@ -1316,6 +1364,8 @@ bool StableDiffusionGGML::build_denoiser() {
                 default_flow_shift = 3.16f;
             } else if (sd_version_is_mage_flow(version)) {
                 default_flow_shift = 6.f;
+            } else if (sd_version_is_llada_image(version)) {
+                default_flow_shift = 1.0f;  // unused: LLADA_IMAGE_SCHEDULER builds a fixed grid
             } else {
                 default_flow_shift = 3.f;
             }
@@ -2375,6 +2425,8 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
             } else if (sd_version_is_flux(version) || sd_version_is_flux2(version) || sd_version_is_longcat(version) || sd_version_is_sefi_image(version)) {
                 diffusion_params.extra = FluxDiffusionExtra{&guidance_tensor,
                                                             local_skip_layers};
+            } else if (version == VERSION_QWEN_IMAGE_2_1) {
+                diffusion_params.extra = QwenImage21DiffusionExtra{&condition.c_token_types};
             } else if (sd_version_is_anima(version)) {
                 diffusion_params.extra = AnimaDiffusionExtra{condition.c_t5_ids.empty() ? nullptr : &condition.c_t5_ids,
                                                              condition.c_t5_weights.empty() ? nullptr : &condition.c_t5_weights};
@@ -2395,6 +2447,9 @@ sd::Tensor<float> StableDiffusionGGML::sample(const std::shared_ptr<DiffusionMod
                     condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
                     condition.c_vinput_mask.empty() ? nullptr : &condition.c_vinput_mask,
                     condition.c_image_embeds.empty() ? nullptr : &condition.c_image_embeds};
+            } else if (sd_version_is_llada_image(version)) {
+                diffusion_params.extra = LLaDAImageDiffusionExtra{
+                    condition.extra_c_crossattns.empty() ? nullptr : &condition.extra_c_crossattns[0]};
             } else if (sd_version_is_minimax_h3(version)) {
                 diffusion_params.extra = MiniMaxH3DiffusionExtra{
                     condition.c_token_types.empty() ? nullptr : &condition.c_token_types,
@@ -2575,7 +2630,7 @@ int StableDiffusionGGML::get_diffusion_model_down_factor() {
     if (sd_version_is_dit(version)) {
         if (sd_version_is_sensenova_u1(version)) {
             down_factor = 32;
-        } else if (sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version)) {
+        } else if (version == VERSION_QWEN_IMAGE_2_1 || sd_version_is_wan(version) || sd_version_is_lingbot_video(version) || sd_version_is_minimax_h3(version)) {
             down_factor = 2;
         } else {
             down_factor = 1;
@@ -2591,6 +2646,8 @@ int StableDiffusionGGML::get_latent_channel() {
             latent_channel = 128;
         } else if (sd_version_is_minimax_h3(version)) {
             latent_channel = 24;
+        } else if (version == VERSION_QWEN_IMAGE_2_1) {
+            latent_channel = 64;
         } else if (version == VERSION_WAN2_2_TI2V) {
             latent_channel = 48;
         } else if (sd_version_is_hunyuan_video(version)) {
@@ -2619,7 +2676,7 @@ int StableDiffusionGGML::get_latent_channel() {
 }
 
 int StableDiffusionGGML::get_image_channels() const {
-    return version == VERSION_QWEN_IMAGE_LAYERED ? 4 : 3;
+    return version == VERSION_QWEN_IMAGE_LAYERED || version == VERSION_QWEN_IMAGE_2_1 ? 4 : 3;
 }
 
 int StableDiffusionGGML::get_image_seq_len(int h, int w) {
@@ -2772,6 +2829,8 @@ std::string StableDiffusionGGML::get_default_ref_image_preset(SDVersion version)
         return "mage_flow";
     } else if (sd_version_is_z_image(version) || sd_version_is_boogu_image(version)) {
         return "z_image_omni";
+    } else if (sd_version_is_llada_image(version)) {
+        return "llada_image";
     } else if (sd_version_is_krea2(version)) {
         // have to make a choice between "krea2_edit" mode (for lbouaraba/krea2edit)
         // and "krea2_ostris_edit" (for krea2 ostris edit)

@@ -189,6 +189,7 @@ static json make_vid_gen_features_json() {
     return {
         {"init_image", true},
         {"end_image", true},
+        {"ref_images", true},
         {"control_frames", true},
         {"high_noise_sample_params", true},
         {"lora", true},

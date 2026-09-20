@@ -2,6 +2,9 @@ set(TARGET sd-server)
 
 option(SD_SERVER_BUILD_FRONTEND "Build server frontend with pnpm" ON)
 
+# Path to pre-built stable-diffusion library installation
+set(SD_SERVER_PREBUILT_LIB "" CACHE PATH "Path to pre-built sd library (e.g. /opt/updatebot/github.com/leejet/stable-diffusion.cpp/latest/)")
+
 set(FRONTEND_DIR "${CMAKE_CURRENT_SOURCE_DIR}/frontend")
 set(GENERATED_HTML_HEADER "${FRONTEND_DIR}/dist/gen_index_html.h")
 
@@ -89,7 +92,15 @@ else()
 endif()
 
 install(TARGETS ${TARGET} RUNTIME)
-target_link_libraries(${TARGET} PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
+
+if(SD_SERVER_PREBUILT_LIB)
+    message(STATUS "Using pre-built sd library from: ${SD_SERVER_PREBUILT_LIB}")
+    target_include_directories(${TARGET} PRIVATE "${SD_SERVER_PREBUILT_LIB}/include")
+    target_link_directories(${TARGET} PRIVATE "${SD_SERVER_PREBUILT_LIB}/lib")
+    target_link_libraries(${TARGET} PRIVATE stable-diffusion ggml ggml-cuda ggml-cpu ggml-base ${CMAKE_THREAD_LIBS_INIT})
+else()
+    target_link_libraries(${TARGET} PRIVATE stable-diffusion ${CMAKE_THREAD_LIBS_INIT})
+endif()
 if(SD_WEBP)
     target_compile_definitions(${TARGET} PRIVATE SD_USE_WEBP)
     target_link_libraries(${TARGET} PRIVATE webp libwebpmux)

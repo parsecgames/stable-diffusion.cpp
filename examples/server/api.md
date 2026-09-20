@@ -582,6 +582,7 @@ Fields returned in `features_by_mode.vid_gen`:
 
 - `init_image`
 - `end_image`
+- `ref_images`
 - `control_frames`
 - `high_noise_sample_params`
 - `lora`
@@ -966,8 +967,9 @@ Response fields:
 Compared with `img_gen`, the `vid_gen` request body:
 
 - `vid_gen` is a single video sequence job, so `batch_count` is not part of the request schema
-- `ref_images`, `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
+- `mask_image`, `control_image`, `control_strength`, `ip_adapter_image`, `ip_adapter_strength`, and `embed_image_metadata` are not part of the request schema
 - `vid_gen` adds `end_image`, `control_frames`, `high_noise_sample_params`, `video_frames`, `fps`, `moe_boundary`, and `vace_strength`
+- `ref_images` is supported for reference-based video generation (e.g. MiniMax-H3 Ref2VA)
 
 Example:
 
@@ -987,6 +989,7 @@ Example:
 
   "init_image": null,
   "end_image": null,
+  "ref_images": [],
   "control_frames": [],
 
   "sample_params": {
@@ -1106,6 +1109,7 @@ Image and frame fields:
 | --- | --- |
 | `init_image` | `string \| null` |
 | `end_image` | `string \| null` |
+| `ref_images` | `array<string>` |
 | `control_frames` | `array<string>` |
 
 LoRA fields:
